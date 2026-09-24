@@ -1,1 +1,493 @@
-.
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>5 в ряд — Мультиплеер с Таймером</title>
+    <!-- Быстрый и стабильный CDN для связи -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #f0f0f0;
+            overflow: hidden;
+            touch-action: none;
+            font-family: Arial, sans-serif;
+        }
+        #gameCanvas {
+            display: block;
+        }
+        #ui {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            pointer-events: auto;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 12px 16px;
+            border-radius: 10px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.15);
+            max-width: 320px;
+        }
+        h1 { margin: 0 0 6px 0; font-size: 18px; }
+        p { margin: 4px 0; font-size: 14px; color: #333; }
+        #timerInfo { font-weight: bold; color: #d32f2f; }
+        .btn {
+            margin-top: 8px;
+            padding: 8px 12px;
+            font-size: 13px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            width: 100%;
+        }
+        #modal {
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            text-align: center;
+            z-index: 10;
+        }
+        #modal h2 { margin-top: 0; }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <h1>Крестики-Нолики (20x20)</h1>
+        <p id="connectionStatus">Инициализация...</p>
+        <p id="turnInfo">Ожидание...</p>
+        <p id="timerInfo"></p>
+        <div id="roomControls">
+            <button id="copyBtn" class="btn" style="display:none;" onclick="copyGameLink()">Скопировать ссылку для друга</button>
+        </div>
+    </div>
+
+    <div id="modal">
+        <h2 id="winnerText">Победа!</h2>
+        <button class="btn" onclick="requestRestart()">Сыграть ещё раз</button>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const connectionStatus = document.getElementById('connectionStatus');
+        const turnInfo = document.getElementById('turnInfo');
+        const timerInfo = document.getElementById('timerInfo');
+        const copyBtn = document.getElementById('copyBtn');
+        const modal = document.getElementById('modal');
+        const winnerText = document.getElementById('winnerText');
+
+        const GRID_SIZE = 20;
+        const WIN_LENGTH = 5;
+        let board = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(0));
+        
+        let currentPlayer = 1; 
+        let gameOver = false;
+        let isOpponentConnected = false;
+
+        let cellSize = 40;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        // --- ТАЙМЕР ---
+        let timeLeft = 60;
+        let timerInterval = null;
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            offsetX = (canvas.width - GRID_SIZE * cellSize) / 2;
+            offsetY = (canvas.height - GRID_SIZE * cellSize) / 2;
+            draw();
+        }
+        window.addEventListener('resize', resizeCanvas);
+
+        const COLOR_BG = '#f5f5f5';
+        const COLOR_GRID = '#b4b4b4';
+        const COLOR_X = '#dc3232';
+        const COLOR_O = '#3264dc';
+
+        // --- СЕТЬ (MQTT) ---
+        const brokers = [
+            'wss://broker.hivemq.com:8884/mqtt',
+            'wss://broker.emqx.io:8084/mqtt',
+            'wss://test.mosquitto.org:8081/mqtt'
+        ];
+
+        const urlParams = new URLSearchParams(window.location.search);
+        let roomId = urlParams.get('room');
+        let myPlayerNumber = roomId ? 2 : 1; 
+        let myRoomLink = '';
+
+        if (!roomId) {
+            roomId = 'gomoku_' + Math.random().toString(36).substring(2, 10);
+            myRoomLink = window.location.origin + window.location.pathname + '?room=' + roomId;
+        }
+
+        const topic = 'tictactoe_rf_game_timed/' + roomId;
+        let currentBrokerIndex = 0;
+        let client = null;
+
+        function connectToBroker() {
+            if (typeof mqtt === 'undefined') {
+                connectionStatus.textContent = "Ошибка загрузки скрипта. Проверьте интернет.";
+                return;
+            }
+
+            if (currentBrokerIndex >= brokers.length) {
+                connectionStatus.textContent = "Не удалось подключиться. Обновите страницу.";
+                return;
+            }
+
+            const currentBroker = brokers[currentBrokerIndex];
+            connectionStatus.textContent = `Подключение...`;
+
+            client = mqtt.connect(currentBroker, { connectTimeout: 5000, reconnectPeriod: 0 });
+            let isConnected = false;
+
+            const timeoutId = setTimeout(() => {
+                if (!isConnected) {
+                    try { client.end(true); } catch(e){}
+                    currentBrokerIndex++;
+                    connectToBroker();
+                }
+            }, 5000);
+
+            client.on('connect', () => {
+                isConnected = true;
+                clearTimeout(timeoutId);
+                client.subscribe(topic);
+                
+                if (myPlayerNumber === 1) {
+                    connectionStatus.textContent = "Комната создана!";
+                    copyBtn.style.display = 'block';
+                } else {
+                    connectionStatus.textContent = "Подключено! Вы Нолики (O).";
+                    client.publish(topic, JSON.stringify({ type: 'JOIN' }));
+                }
+                updateTurnInfo();
+            });
+
+            client.on('error', () => {
+                if (!isConnected) {
+                    clearTimeout(timeoutId);
+                    try { client.end(true); } catch(e){}
+                    currentBrokerIndex++;
+                    connectToBroker();
+                }
+            });
+
+            client.on('message', (tpc, message) => {
+                try {
+                    const data = JSON.parse(message.toString());
+                    
+                    if (data.type === 'JOIN' && myPlayerNumber === 1) {
+                        isOpponentConnected = true;
+                        connectionStatus.textContent = "Соперник подключен! 🎮";
+                        copyBtn.style.display = 'none';
+                        updateTurnInfo();
+                        resetAndStartTimer();
+                        client.publish(topic, JSON.stringify({ 
+                            type: 'ACK_JOIN', board: board, currentPlayer: currentPlayer 
+                        }));
+                    } 
+                    else if (data.type === 'ACK_JOIN' && myPlayerNumber === 2) {
+                        isOpponentConnected = true;
+                        connectionStatus.textContent = "Соперник подключен! 🎮";
+                        if (data.board) board = data.board;
+                        if (data.currentPlayer) currentPlayer = data.currentPlayer;
+                        updateTurnInfo();
+                        resetAndStartTimer();
+                        draw();
+                    } 
+                    else if (data.type === 'MOVE') {
+                        applyMove(data.r, data.c, data.player);
+                    }
+                    else if (data.type === 'SKIP_TURN') {
+                        // Ход принудительно передается
+                        currentPlayer = (data.player === 1) ? 2 : 1;
+                        updateTurnInfo();
+                        resetAndStartTimer();
+                        draw();
+                    }
+                    else if (data.type === 'RESTART') {
+                        resetGameLocally();
+                    }
+                } catch(e) {
+                    console.error("Ошибка сообщения:", e);
+                }
+            });
+        }
+
+        // --- ЛОГИКА ТАЙМЕРА ---
+        function resetAndStartTimer() {
+            clearInterval(timerInterval);
+            if (!isOpponentConnected || gameOver) {
+                timerInfo.textContent = "";
+                return;
+            }
+            timeLeft = 60;
+            timerInfo.textContent = `⏳ Время на ход: ${timeLeft} сек`;
+            
+            timerInterval = setInterval(() => {
+                timeLeft--;
+                timerInfo.textContent = `⏳ Время на ход: ${timeLeft} сек`;
+                
+                if (timeLeft <= 0) {
+                    clearInterval(timerInterval);
+                    timerInfo.textContent = "⌛ Время вышло!";
+                    // Тот, чей был ход, отправляет сигнал о пропуске
+                    if (currentPlayer === myPlayerNumber) {
+                        client.publish(topic, JSON.stringify({ type: 'SKIP_TURN', player: myPlayerNumber }));
+                    }
+                }
+            }, 1000);
+        }
+
+        function copyGameLink() {
+            navigator.clipboard.writeText(myRoomLink).then(() => {
+                copyBtn.textContent = "Ссылка скопирована! 📋";
+                setTimeout(() => copyBtn.textContent = "Скопировать ссылку для друга", 3000);
+            }).catch(() => {
+                prompt("Скопируйте эту ссылку и отправьте другу:", myRoomLink);
+            });
+        }
+
+        function updateTurnInfo() {
+            if (!isOpponentConnected) {
+                turnInfo.textContent = "Ожидание соперника...";
+                turnInfo.style.color = '#666';
+                return;
+            }
+            const isMyTurn = (currentPlayer === myPlayerNumber);
+            if (isMyTurn) {
+                turnInfo.textContent = `Ваш ход! (${myPlayerNumber === 1 ? 'Крестики X' : 'Нолики O'})`;
+                turnInfo.style.color = myPlayerNumber === 1 ? COLOR_X : COLOR_O;
+            } else {
+                turnInfo.textContent = `Ход соперника (${currentPlayer === 1 ? 'Крестики X' : 'Нолики O'})...`;
+                turnInfo.style.color = '#666';
+            }
+        }
+
+        function draw() {
+            ctx.fillStyle = COLOR_BG;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.strokeStyle = COLOR_GRID;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            for (let i = 0; i <= GRID_SIZE; i++) {
+                ctx.moveTo(offsetX, offsetY + i * cellSize);
+                ctx.lineTo(offsetX + GRID_SIZE * cellSize, offsetY + i * cellSize);
+                ctx.moveTo(offsetX + i * cellSize, offsetY);
+                ctx.lineTo(offsetX + i * cellSize, offsetY + GRID_SIZE * cellSize);
+            }
+            ctx.stroke();
+
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(offsetX, offsetY, GRID_SIZE * cellSize, GRID_SIZE * cellSize);
+
+            const padding = cellSize * 0.2;
+            const thickness = Math.max(2, cellSize * 0.1);
+
+            for (let r = 0; r < GRID_SIZE; r++) {
+                for (let c = 0; c < GRID_SIZE; c++) {
+                    const val = board[r][c];
+                    if (val === 0) continue;
+
+                    const cx = offsetX + c * cellSize;
+                    const cy = offsetY + r * cellSize;
+                    ctx.lineWidth = thickness;
+                    ctx.lineCap = 'round';
+
+                    if (val === 1) { 
+                        ctx.strokeStyle = COLOR_X;
+                        ctx.beginPath();
+                        ctx.moveTo(cx + padding, cy + padding);
+                        ctx.lineTo(cx + cellSize - padding, cy + cellSize - padding);
+                        ctx.moveTo(cx + cellSize - padding, cy + padding);
+                        ctx.lineTo(cx + padding, cy + cellSize - padding);
+                        ctx.stroke();
+                    } else if (val === 2) { 
+                        ctx.strokeStyle = COLOR_O;
+                        ctx.beginPath();
+                        ctx.arc(cx + cellSize/2, cy + cellSize/2, cellSize/2 - padding, 0, Math.PI * 2);
+                        ctx.stroke();
+                    }
+                }
+            }
+        }
+
+        function checkWin(r, c, player) {
+            const directions = [[0, 1], [1, 0], [1, 1], [1, -1]];
+            for (let [dr, dc] of directions) {
+                let count = 1;
+                for (let i = 1; i < WIN_LENGTH; i++) {
+                    let nr = r + dr * i, nc = c + dc * i;
+                    if (nr >= 0 && nr < GRID_SIZE && nc >= 0 && nc < GRID_SIZE && board[nr][nc] === player) count++;
+                    else break;
+                }
+                for (let i = 1; i < WIN_LENGTH; i++) {
+                    let nr = r - dr * i, nc = c - dc * i;
+                    if (nr >= 0 && nr < GRID_SIZE && nc >= 0 && nc < GRID_SIZE && board[nr][nc] === player) count++;
+                    else break;
+                }
+                if (count >= WIN_LENGTH) return true;
+            }
+            return false;
+        }
+
+        function applyMove(r, c, player) {
+            if (board[r][c] !== 0) return;
+            board[r][c] = player;
+            
+            if (checkWin(r, c, player)) {
+                gameOver = true;
+                clearInterval(timerInterval);
+                timerInfo.textContent = "";
+                winnerText.textContent = (player === myPlayerNumber) ? "Вы победили! 🎉" : "Вы проиграли 😞";
+                modal.style.display = 'block';
+                draw();
+                return;
+            }
+
+            currentPlayer = (player === 1) ? 2 : 1;
+            updateTurnInfo();
+            resetAndStartTimer();
+            draw();
+        }
+
+        function handleClick(x, y) {
+            if (gameOver || !isOpponentConnected) return;
+            if (currentPlayer !== myPlayerNumber) return;
+
+            const c = Math.floor((x - offsetX) / cellSize);
+            const r = Math.floor((y - offsetY) / cellSize);
+
+            if (r >= 0 && r < GRID_SIZE && c >= 0 && c < GRID_SIZE && board[r][c] === 0) {
+                client.publish(topic, JSON.stringify({ type: 'MOVE', r: r, c: c, player: myPlayerNumber }));
+            }
+        }
+
+        function requestRestart() {
+            client.publish(topic, JSON.stringify({ type: 'RESTART' }));
+        }
+
+        function resetGameLocally() {
+            board = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(0));
+            currentPlayer = 1;
+            gameOver = false;
+            modal.style.display = 'none';
+            updateTurnInfo();
+            resetAndStartTimer();
+            draw();
+        }
+
+        // --- УПРАВЛЕНИЕ КАМЕРОЙ И ФИКС КЛИКОВ ---
+        let isDragging = false, startDragX = 0, startDragY = 0;
+        let startClickX = 0, startClickY = 0; // Для отслеживания реального клика
+
+        canvas.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            startDragX = e.clientX; startDragY = e.clientY;
+            startClickX = e.clientX; startClickY = e.clientY;
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            offsetX += e.clientX - startDragX;
+            offsetY += e.clientY - startDragY;
+            startDragX = e.clientX; startDragY = e.clientY;
+            draw();
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            isDragging = false;
+            // Если курсор сдвинулся меньше чем на 10 пикселей, считаем это кликом, а не свайпом
+            const dist = Math.hypot(e.clientX - startClickX, e.clientY - startClickY);
+            if (dist < 10) handleClick(e.clientX, e.clientY);
+        });
+
+        let initialPinchDistance = null;
+        let startTouchX = 0, startTouchY = 0;
+
+        canvas.addEventListener('touchstart', (e) => {
+            if (e.touches.length === 1) {
+                isDragging = true;
+                startDragX = e.touches[0].clientX; startDragY = e.touches[0].clientY;
+                startTouchX = e.touches[0].clientX; startTouchY = e.touches[0].clientY;
+            } else if (e.touches.length === 2) {
+                isDragging = false;
+                initialPinchDistance = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY
+                );
+            }
+        });
+
+        canvas.addEventListener('touchmove', (e) => {
+            if (e.touches.length === 1 && isDragging) {
+                offsetX += e.touches[0].clientX - startDragX;
+                offsetY += e.touches[0].clientY - startDragY;
+                startDragX = e.touches[0].clientX; startDragY = e.touches[0].clientY;
+                draw();
+            } else if (e.touches.length === 2 && initialPinchDistance) {
+                e.preventDefault();
+                const dist = Math.hypot(
+                    e.touches[0].clientX - e.touches[1].clientX,
+                    e.touches[0].clientY - e.touches[1].clientY
+                );
+                const zoomFactor = dist / initialPinchDistance;
+                let newSize = Math.max(15, Math.min(cellSize * zoomFactor, 100));
+
+                if (newSize !== cellSize) {
+                    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+                    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                    const factor = newSize / cellSize;
+                    offsetX = cx - (cx - offsetX) * factor;
+                    offsetY = cy - (cy - offsetY) * factor;
+                    cellSize = newSize;
+                }
+                initialPinchDistance = dist;
+                draw();
+            }
+        }, { passive: false });
+
+        canvas.addEventListener('touchend', (e) => {
+            if (e.changedTouches.length === 1) {
+                const dist = Math.hypot(e.changedTouches[0].clientX - startTouchX, e.changedTouches[0].clientY - startTouchY);
+                if (dist < 10) handleClick(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+            }
+            if (e.touches.length < 2) initialPinchDistance = null;
+            if (e.touches.length === 0) isDragging = false;
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
+            let newSize = Math.max(15, Math.min(cellSize * zoomFactor, 100));
+            if (newSize !== cellSize) {
+                const factor = newSize / cellSize;
+                offsetX = e.clientX - (e.clientX - offsetX) * factor;
+                offsetY = e.clientY - (e.clientY - offsetY) * factor;
+                cellSize = newSize;
+                draw();
+            }
+        });
+
+        resizeCanvas();
+        connectToBroker();
+    </script>
+</body>
+</html>
